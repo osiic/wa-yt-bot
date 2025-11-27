@@ -1,8 +1,11 @@
-const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const baileys = require('@whiskeysockets/baileys');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = baileys;
 const fs = require('fs');
+const { exec } = require('child_process');
 const ytsr = require('ytsr');
 const YTDlpWrap = require('yt-dlp-wrap').default;
 const qrcode = require('qrcode-terminal');
+const { buildYtDlpArgs } = require('./lib/yt');
 
 // =================================================================
 // KONFIGURASI BOT
@@ -12,6 +15,7 @@ const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 jam dalam milidetik
 const AUTH_FILE_PATH = 'auth_info_baileys'; // Folder untuk menyimpan sesi WA
 const MAX_VIDEO_CHECK = 3; // <-- JUMLAH VIDEO APAPUN YANG AKAN DIAMBIL
 const YT_DLP_BIN_PATH = `./yt-dlp${process.platform === 'win32' ? '.exe' : ''}`; // Biner yt-dlp sesuai OS
+const INITIAL_SYNC_DELAY_MS = 15_000; // jeda awal setelah login untuk pastikan link perangkat
 
 // yt-dlp wrapper (lebih stabil menghadapi perubahan cipher YouTube dibanding ytdl-core)
 const ytdlp = new YTDlpWrap(YT_DLP_BIN_PATH);
@@ -26,6 +30,30 @@ async function ensureYtDlpBinary() {
         ytdlp.setBinaryPath(YT_DLP_BIN_PATH);
         console.log('[DOWNLOAD] yt-dlp siap digunakan.');
     }
+}
+
+function compressVideo(inputPath, outputPath) {
+    return new Promise((resolve, reject) => {
+        const ffmpegCmd = [
+            'ffmpeg',
+            '-y',
+            `-i "${inputPath}"`,
+            '-vf "scale=720:-2"',
+            '-c:v libx264 -preset veryfast -profile:v main -level 3.1 -pix_fmt yuv420p',
+            '-crf 28',
+            '-c:a aac -b:a 96k',
+            '-movflags +faststart',
+            `"${outputPath}"`
+        ].join(' ');
+
+        exec(ffmpegCmd, { maxBuffer: 1024 * 1024 * 50 }, (error, _stdout, stderr) => {
+            if (error) {
+                console.error('[DOWNLOAD] Kompresi gagal:', stderr);
+                return reject(error);
+            }
+            resolve(true);
+        });
+    });
 }
 
 // =================================================================
@@ -82,22 +110,17 @@ async function downloadAndConvertVideo(videoUrl, outputPath) {
     try {
         await ensureYtDlpBinary();
 
-        const args = [
-            videoUrl,
-            '--download-sections', '*0:00:00-0:00:30', // potong 0-30 detik via ffmpeg internal yt-dlp
-            '--force-keyframes-at-cuts',
-            '-f', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b', // utamakan mp4 + audio
-            '--merge-output-format', 'mp4',
-            '--no-part',
-            '--force-overwrites',
-            '-o', outputPath,
-        ];
-
+        const args = buildYtDlpArgs(videoUrl, outputPath);
         await ytdlp.execPromise(args, { maxBuffer: 1024 * 1024 * 50 });
+
+        const compressedPath = outputPath.replace('.mp4', '_compressed.mp4');
+        await compressVideo(outputPath, compressedPath);
+        fs.renameSync(compressedPath, outputPath);
+
         console.log(`[DOWNLOAD] Konversi selesai. File tersimpan di: ${outputPath}`);
         return true;
     } catch (error) {
-        console.error(`[DOWNLOAD] yt-dlp Error: ${error.message || error}`);
+        console.error(`[DOWNLOAD] yt-dlp/FFmpeg Error: ${error.message || error}`);
         return false;
     }
 }
@@ -116,16 +139,21 @@ async function uploadVideoStatus(sock, videoPath, caption) {
     }
 
     console.log('[WA] Mengunggah Status Video...');
-    const statusJid = 'status@broadcast'; 
-    const videoBuffer = fs.readFileSync(videoPath);
+    const statusJid = 'status@broadcast';
 
     try {
-        await sock.sendMessage(statusJid, { 
-            video: videoBuffer, 
-            caption: caption,
-        });
-        
-        console.log('[WA] Status Video berhasil diunggah!');
+        const sendResult = await sock.sendMessage(
+            statusJid,
+            {
+                video: { url: videoPath },
+                caption: caption,
+                mimetype: 'video/mp4',
+                fileName: 'status.mp4',
+            },
+            { mediaUploadTimeoutMs: 120000 }
+        );
+
+        console.log('[WA] Status Video berhasil diunggah!', sendResult?.key?.id || '');
         fs.unlinkSync(videoPath);
         console.log(`[FILE] File ${videoPath} telah dihapus.`);
 
@@ -153,7 +181,7 @@ async function botAlgorithm(sock) {
         
         const outputFileName = `status_${Date.now()}.mp4`;
         const downloadSuccess = await downloadAndConvertVideo(video.url, outputFileName);
-        
+
         if (downloadSuccess) {
             const captionText = `Potongan 30 detik Video Terbaru dari Motivational Resource: ${video.title} | Link: ${video.url}`;
             await uploadVideoStatus(sock, outputFileName, captionText);
@@ -173,9 +201,11 @@ async function botAlgorithm(sock) {
 async function connectToWhatsApp() {
     console.log('[WA] Memulai koneksi WhatsApp...');
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_FILE_PATH);
-    
+    const { version } = await fetchLatestBaileysVersion();
+
     const sock = makeWASocket({
         auth: state,
+        version,
         printQRInTerminal: true,
         browser: ['Chrome (Linux)', '1.0.0', 'Linux']
     });
@@ -193,9 +223,10 @@ async function connectToWhatsApp() {
             }
         } else if (connection === 'open') {
             console.log('[WA] Koneksi berhasil! Bot siap beroperasi.');
-            
-            botAlgorithm(sock);
-            
+
+            console.log(`[WA] Menunggu ${INITIAL_SYNC_DELAY_MS / 1000}s untuk sinkronisasi perangkat...`);
+            // beri jeda agar initial sync & link device benar-benar selesai
+            setTimeout(() => botAlgorithm(sock), INITIAL_SYNC_DELAY_MS);
             setInterval(() => botAlgorithm(sock), CHECK_INTERVAL_MS);
         }
 
@@ -206,7 +237,25 @@ async function connectToWhatsApp() {
         }
     });
 
+    sock.ev.on('contacts.upsert', (contacts) => {
+        contacts.forEach(contact => {
+            sock.contacts = sock.contacts || {};
+            sock.contacts[contact.id] = contact;
+        });
+    });
+
     sock.ev.on('creds.update', saveCreds);
 }
 
-connectToWhatsApp().catch(err => console.error('Error Fatal Bot:', err));
+if (require.main === module) {
+    connectToWhatsApp().catch(err => console.error('Error Fatal Bot:', err));
+}
+
+module.exports = {
+    buildYtDlpArgs,
+    getLatestVideos,
+    downloadAndConvertVideo,
+    uploadVideoStatus,
+    ensureYtDlpBinary,
+    compressVideo,
+};

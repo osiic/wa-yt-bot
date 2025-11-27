@@ -4,16 +4,21 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node ."
+    "start": "node .",
+    "test": "jest"
   },
   "keywords": [],
-  "author": "",
+  "author": "Osi Ic <osiic.offcl@gmail.com>",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "@whiskeysockets/baileys": "6.7.7",
     "qrcode-terminal": "^0.12.0",
     "yt-dlp-wrap": "^2.3.12",
     "ytsr": "^3.8.4"
-  }
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  },
+  "repository": "git@github.com:osiic/wa-yt-bot.git"
 }
